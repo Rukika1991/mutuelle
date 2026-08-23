@@ -1887,20 +1887,31 @@ member_progress = (
 # HEADER
 # ============================================================
 
+
+
 st.markdown(
     """
-    <div class="dashboard-header">
+    <div class="dashboard-title"
+         style="
+            color:#000000 !important;
+            font-size:42px !important;
+            font-weight:800 !important;
+            line-height:1.2;
+            margin-bottom:8px;
+         ">
+        📊 Rubavu Mutuelle Monitoring Dashboard
+    </div>
 
-        <div class="dashboard-title">
-            📊 Rubavu Mutuelle Monitoring Dashboard
-        </div>
-
-        <div class="dashboard-subtitle">
-            Official Baseline Monitoring • Progress as of 22/08/2026
-            <br>
-            Today Performance = 22/08/2026 − 21/08/2026
-        </div>
-
+    <div class="dashboard-subtitle"
+         style="
+            color:#000000 !important;
+            font-size:18px !important;
+            font-weight:600 !important;
+            line-height:1.6;
+         ">
+        Official Baseline Monitoring • Progress as of 22/08/2026
+        <br>
+        Today Performance = 22/08/2026 − 21/08/2026
     </div>
     """,
     unsafe_allow_html=True
@@ -2149,39 +2160,35 @@ c1, c2 = st.columns(2)
 with c1:
 
     st.markdown(
-        f"""
-        <div class="kpi-card">
-            <div class="kpi-label">
-                💰 Money Progress
-            </div>
-
-            <div class="kpi-value"
-                 style="color:#000000 !important;">
-                {money_progress:.2f}%
-            </div>
+    f"""
+    <div class="kpi-card">
+        <div class="kpi-label">
+            💰 Money Progress
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        <div class="kpi-value" style="color:#000000 !important;">
+            {money_progress:.2f}%
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 
 with c2:
 
     st.markdown(
-        f"""
-        <div class="kpi-card">
-            <div class="kpi-label">
-                👥 Member Progress
-            </div>
-
-            <div class="kpi-value"
-                 style="color:#000000 !important;">
-                {member_progress:.2f}%
-            </div>
+    f"""
+    <div class="kpi-card">
+        <div class="kpi-label">
+            👥 Member Progress
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        <div class="kpi-value" style="color:#000000 !important;">
+            {member_progress:.2f}%
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 
 # ============================================================
