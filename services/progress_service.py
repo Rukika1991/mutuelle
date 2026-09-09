@@ -1,768 +1,4 @@
-# ============================================================
-# RUBAVU MUTUELLE MONITORING
-# AUTOMATIC DAILY PROGRESS PROCESSOR
-#
-# PURPOSE
-# -------
-# Automatically process daily uploaded Excel files.
-#
-# Example:
-#
-#   23/08/2026 -> historical
-#   24/08/2026 -> historical
-#   25/08/2026 -> previous
-#   26/08/2026 -> current
-#
-# dashboard_service.py then calculates:
-#
-#   Today = Current - Previous
-#   Remaining = Baseline - Current
-#
-# ============================================================
-
-from pathlib import Path
-from typing import Optional
-import re
-import shutil
-import pandas as pd
-
-
-# ============================================================
-# PROJECT PATHS
-# ============================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-UPLOAD_DIR = PROJECT_ROOT / "data" / "uploads"
-
-OUTPUT_DIR = PROJECT_ROOT / "output"
-
-PROCESSED_FILE = OUTPUT_DIR / "processed_progress.xlsx"
-
-
-# ============================================================
-# EXPECTED STRUCTURE
-# ============================================================
-
-EXPECTED_SECTORS = 12
-EXPECTED_CELLS = 80
-EXPECTED_VILLAGES = 519
-
-
-LOCATION_COLUMNS = [
-    "district",
-    "sector",
-    "cell",
-    "village",
-]
-
-
-LEVELS = [1, 2, 3, 4, 5]
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def normalize_text(value) -> str:
-    """
-    Normalize location text.
-
-    Examples:
-
-        ' BUGESHI '  -> 'BUGESHI'
-        'Bugeshi'    -> 'BUGESHI'
-        'BUGESHI\n'  -> 'BUGESHI'
-
-    This is important because location matching must be
-    case-insensitive.
-    """
-
-    if pd.isna(value):
-        return ""
-
-    value = str(value)
-
-    value = value.replace("\n", " ")
-    value = value.replace("\r", " ")
-
-    value = " ".join(value.split())
-
-    return value.strip().upper()
-
-
-def normalize_column_name(value) -> str:
-    """
-    Convert a column name into a standard snake_case format.
-    """
-
-    value = str(value).strip().lower()
-
-    value = value.replace("\n", " ")
-    value = value.replace("\r", " ")
-
-    value = " ".join(value.split())
-
-    value = value.replace(" ", "_")
-    value = value.replace("-", "_")
-    value = value.replace("/", "_")
-
-    while "__" in value:
-        value = value.replace("__", "_")
-
-    return value
-
-
-def to_numeric(series) -> pd.Series:
-    """
-    Safely convert values to numbers.
-    """
-
-    return pd.to_numeric(
-        series,
-        errors="coerce"
-    ).fillna(0)
-
-
-# ============================================================
-# EXTRACT REPORT DATE
-# ============================================================
-
-def extract_report_date(file_path: Path) -> pd.Timestamp:
-    """
-    Extract report date from the first Excel cell.
-
-    Actual Excel example:
-
-        Enrolment Report
-        Period: 2026
-        Report Date: 8/25/2026
-
-    """
-
-    raw = pd.read_excel(
-        file_path,
-        header=None,
-        nrows=3
-    )
-
-    first_value = raw.iloc[0, 0]
-
-    if pd.isna(first_value):
-        raise ValueError(
-            f"Could not find report date in {file_path.name}"
-        )
-
-    text = str(first_value)
-
-    # Look specifically for:
-    #
-    # Report Date: 8/25/2026
-    #
-    match = re.search(
-        r"Report\s*Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    if not match:
-        raise ValueError(
-            f"Could not extract report date from "
-            f"{file_path.name}\n\n"
-            f"First cell contains:\n{text}"
-        )
-
-    date_text = match.group(1)
-
-    report_date = pd.to_datetime(
-        date_text,
-        errors="coerce"
-    )
-
-    if pd.isna(report_date):
-        raise ValueError(
-            f"Invalid report date '{date_text}' "
-            f"in {file_path.name}"
-        )
-
-    return pd.Timestamp(report_date).normalize()
-
-
-# ============================================================
-# READ RUBAVU EXCEL
-# ============================================================
-
-def read_rubavu_excel(file_path: Path) -> pd.DataFrame:
-    """
-    Read the Rubavu Mutuelle Excel structure.
-
-    Actual structure:
-
-    Row 0:
-        Enrolment Report / Period / Report Date
-
-    Row 1:
-        DISTRICT SECTOR CELL VILLAGE LEVEL 1 ...
-
-    Row 2:
-        Households Members Amount ...
-
-    Row 3 onward:
-        Actual village data
-
-    Therefore we read header=None and manually select
-    columns 0-18.
-    """
-
-    raw = pd.read_excel(
-        file_path,
-        header=None
-    )
-
-    if len(raw) < 4:
-        raise ValueError(
-            f"{file_path.name} does not contain enough rows."
-        )
-
-    # --------------------------------------------------------
-    # Actual columns in the Excel
-    # --------------------------------------------------------
-
-    expected_columns = [
-        "district",
-        "sector",
-        "cell",
-        "village",
-
-        "level_1_households",
-        "level_1_members",
-        "level_1_amount",
-
-        "level_2_households",
-        "level_2_members",
-        "level_2_amount",
-
-        "level_3_households",
-        "level_3_members",
-        "level_3_amount",
-
-        "level_4_households",
-        "level_4_members",
-        "level_4_amount",
-
-        "level_5_households",
-        "level_5_members",
-        "level_5_amount",
-    ]
-
-    if raw.shape[1] < 19:
-        raise ValueError(
-            f"{file_path.name} has only {raw.shape[1]} columns. "
-            f"Expected at least 19 columns."
-        )
-
-    # --------------------------------------------------------
-    # Data begins at row 3
-    # --------------------------------------------------------
-
-    df = raw.iloc[3:, :19].copy()
-
-    df.columns = expected_columns
-
-    # --------------------------------------------------------
-    # Remove completely empty rows
-    # --------------------------------------------------------
-
-    df = df.dropna(
-        how="all"
-    ).copy()
-
-    # --------------------------------------------------------
-    # Normalize locations
-    # --------------------------------------------------------
-
-    for column in LOCATION_COLUMNS:
-
-        df[column] = df[column].apply(
-            normalize_text
-        )
-
-    # --------------------------------------------------------
-    # Remove rows without village
-    # --------------------------------------------------------
-
-    df = df[
-        df["village"] != ""
-    ].copy()
-
-    # --------------------------------------------------------
-    # Numeric columns
-    # --------------------------------------------------------
-
-    numeric_columns = [
-        column
-        for column in df.columns
-        if column not in LOCATION_COLUMNS
-    ]
-
-    for column in numeric_columns:
-
-        df[column] = to_numeric(
-            df[column]
-        )
-
-    # --------------------------------------------------------
-    # Calculate total members
-    # --------------------------------------------------------
-
-    member_columns = [
-        f"level_{level}_members"
-        for level in LEVELS
-    ]
-
-    df["members"] = (
-        df[member_columns]
-        .sum(axis=1)
-    )
-
-    # --------------------------------------------------------
-    # Calculate total money
-    # --------------------------------------------------------
-
-    amount_columns = [
-        f"level_{level}_amount"
-        for level in LEVELS
-    ]
-
-    df["amount"] = (
-        df[amount_columns]
-        .sum(axis=1)
-    )
-
-    return df.reset_index(
-        drop=True
-    )
-
-
-# ============================================================
-# VALIDATE LOCATION STRUCTURE
-# ============================================================
-
-def validate_locations(
-    df: pd.DataFrame,
-    file_name: str
-):
-    """
-    Validate the geographical structure.
-
-    Expected:
-
-        12 sectors
-        80 cells
-        519 villages
-    """
-
-    sectors = (
-        df["sector"]
-        .replace("", pd.NA)
-        .dropna()
-        .nunique()
-    )
-
-    cells = (
-        df[
-            ["sector", "cell"]
-        ]
-        .drop_duplicates()
-        .shape[0]
-    )
-
-    villages = (
-        df[
-            [
-                "sector",
-                "cell",
-                "village"
-            ]
-        ]
-        .drop_duplicates()
-        .shape[0]
-    )
-
-    print(
-        f"Location validation for {file_name}:"
-    )
-
-    print(
-        f"  Sectors:  {sectors}"
-    )
-
-    print(
-        f"  Cells:    {cells}"
-    )
-
-    print(
-        f"  Villages: {villages}"
-    )
-
-    if sectors != EXPECTED_SECTORS:
-
-        raise ValueError(
-            f"{file_name}: Expected "
-            f"{EXPECTED_SECTORS} sectors but found "
-            f"{sectors}."
-        )
-
-    if cells != EXPECTED_CELLS:
-
-        raise ValueError(
-            f"{file_name}: Expected "
-            f"{EXPECTED_CELLS} cells but found "
-            f"{cells}."
-        )
-
-    if villages != EXPECTED_VILLAGES:
-
-        raise ValueError(
-            f"{file_name}: Expected "
-            f"{EXPECTED_VILLAGES} villages but found "
-            f"{villages}."
-        )
-
-    return {
-        "sectors": sectors,
-        "cells": cells,
-        "villages": villages,
-    }
-
-
-# ============================================================
-# PROCESS ONE FILE
-# ============================================================
-
-def process_file(
-    file_path: Path
-) -> pd.DataFrame:
-    """
-    Process one daily Excel file.
-    """
-
-    print("-" * 70)
-
-    print(
-        f"Processing: {file_path.name}"
-    )
-
-    report_date = extract_report_date(
-        file_path
-    )
-
-    print(
-        f"Report date: "
-        f"{report_date.strftime('%Y-%m-%d')}"
-    )
-
-    df = read_rubavu_excel(
-        file_path
-    )
-
-    # --------------------------------------------------------
-    # Validate structure
-    # --------------------------------------------------------
-
-    validate_locations(
-        df,
-        file_path.name
-    )
-
-    # --------------------------------------------------------
-    # Add report date
-    # --------------------------------------------------------
-
-    df["report_date"] = report_date
-
-    # --------------------------------------------------------
-    # Keep only fields required by dashboard
-    # --------------------------------------------------------
-
-    output_columns = [
-        "district",
-        "sector",
-        "cell",
-        "village",
-
-        "level_1_members",
-        "level_2_members",
-        "level_3_members",
-        "level_4_members",
-        "level_5_members",
-
-        "level_1_amount",
-        "level_2_amount",
-        "level_3_amount",
-        "level_4_amount",
-        "level_5_amount",
-
-        "members",
-        "amount",
-
-        "report_date",
-    ]
-
-    df = df[
-        output_columns
-    ].copy()
-
-    print(
-        f"Rows processed: {len(df):,}"
-    )
-
-    print(
-        f"Members: {df['members'].sum():,.0f}"
-    )
-
-    print(
-        f"Amount: {df['amount'].sum():,.0f}"
-    )
-
-    return df
-
-
-# ============================================================
-# LOAD EXISTING PROCESSED DATA
-# ============================================================
-
-def load_existing_processed() -> pd.DataFrame:
-    """
-    Load existing processed history.
-
-    If the output file does not exist, return an empty
-    dataframe.
-    """
-
-    if not PROCESSED_FILE.exists():
-
-        return pd.DataFrame()
-
-    print(
-        f"Loading existing processed history:"
-    )
-
-    print(
-        PROCESSED_FILE
-    )
-
-    df = pd.read_excel(
-        PROCESSED_FILE
-    )
-
-    df.columns = [
-        normalize_column_name(c)
-        for c in df.columns
-    ]
-
-    # --------------------------------------------------------
-    # Normalize locations
-    # --------------------------------------------------------
-
-    for column in LOCATION_COLUMNS:
-
-        if column in df.columns:
-
-            df[column] = df[column].apply(
-                normalize_text
-            )
-
-    # --------------------------------------------------------
-    # Date
-    # --------------------------------------------------------
-
-    if "report_date" in df.columns:
-
-        df["report_date"] = pd.to_datetime(
-            df["report_date"],
-            errors="coerce"
-        ).dt.normalize()
-
-    return df
-
-
-# ============================================================
-# MERGE DAILY HISTORY
-# ============================================================
-
-def merge_progress(
-    existing: pd.DataFrame,
-    new_data: pd.DataFrame
-) -> pd.DataFrame:
-    """
-    Merge historical progress with new uploads.
-
-    Important:
-
-    A report date is considered a complete snapshot.
-
-    If the same date is uploaded again, the new file replaces
-    the old snapshot for that date.
-
-    This prevents duplicate 25-August data.
-    """
-
-    if existing.empty:
-
-        combined = new_data.copy()
-
-    else:
-
-        combined = pd.concat(
-            [
-                existing,
-                new_data
-            ],
-            ignore_index=True
-        )
-
-    # --------------------------------------------------------
-    # Ensure dates are normalized
-    # --------------------------------------------------------
-
-    combined["report_date"] = pd.to_datetime(
-        combined["report_date"],
-        errors="coerce"
-    ).dt.normalize()
-
-    # --------------------------------------------------------
-    # Normalize locations
-    # --------------------------------------------------------
-
-    for column in LOCATION_COLUMNS:
-
-        combined[column] = combined[column].apply(
-            normalize_text
-        )
-
-    # --------------------------------------------------------
-    # Remove duplicate snapshot rows
-    #
-    # Key:
-    #
-    # date + district + sector + cell + village
-    #
-    # keep last means:
-    #
-    # new upload replaces old upload.
-    # --------------------------------------------------------
-
-    key_columns = [
-        "report_date",
-        "district",
-        "sector",
-        "cell",
-        "village",
-    ]
-
-    combined = combined.drop_duplicates(
-        subset=key_columns,
-        keep="last"
-    )
-
-    # --------------------------------------------------------
-    # Sort chronologically
-    # --------------------------------------------------------
-
-    combined = combined.sort_values(
-        by=[
-            "report_date",
-            "district",
-            "sector",
-            "cell",
-            "village",
-        ]
-    ).reset_index(
-        drop=True
-    )
-
-    return combined
-
-
-# ============================================================
-# SAVE PROCESSED DATA
-# ============================================================
-
-def save_processed(
-    df: pd.DataFrame
-):
-    """
-    Save processed history to Excel.
-    """
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # --------------------------------------------------------
-    # Temporary file first
-    #
-    # This reduces risk of leaving a corrupted output file
-    # if writing fails.
-    # --------------------------------------------------------
-
-    temp_file = (
-        OUTPUT_DIR
-        / "processed_progress.tmp.xlsx"
-    )
-
-    df.to_excel(
-        temp_file,
-        index=False
-    )
-
-    shutil.move(
-        str(temp_file),
-        str(PROCESSED_FILE)
-    )
-
-    print()
-
-    print(
-        "Saved processed file:"
-    )
-
-    print(
-        PROCESSED_FILE
-    )
-
-
-# ============================================================
-# GET UPLOAD FILES
-# ============================================================
-
-def get_upload_files():
-    """
-    Find Excel files in data/uploads.
-
-    Temporary Excel files beginning with '~$' are ignored.
-    """
-
-    if not UPLOAD_DIR.exists():
-
-        UPLOAD_DIR.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-    files = sorted(
-        [
-            f
-            for f in UPLOAD_DIR.glob("*.xlsx")
-            if not f.name.startswith("~$")
-        ]
-    )
-
-    return files
-
-
+```python
 # ============================================================
 # AUTOMATIC PROCESSOR
 # ============================================================
@@ -773,12 +9,18 @@ def process_uploaded_files():
 
     Every Excel file in data/uploads is inspected.
 
+    Invalid Excel files are SKIPPED instead of stopping the
+    entire processing operation.
+
     Historical dates are retained.
 
     Same-date snapshots replace the old snapshot.
 
-    This means you can safely upload a corrected Excel for
-    the same date.
+    This means:
+        - One bad Excel does NOT crash the dashboard
+        - Valid Excel files continue processing
+        - Invalid files are reported in the log
+        - Dashboard continues normally
     """
 
     print()
@@ -874,12 +116,32 @@ def process_uploaded_files():
 
     new_data_frames = []
 
+    # Keep track of files that could not be processed
+    skipped_files = []
+
     for file_path in files:
+
+        print()
+
+        print("-" * 70)
+
+        print(
+            f"Processing file: {file_path.name}"
+        )
 
         try:
 
+            # ------------------------------------------------
+            # Extract report date
+            # ------------------------------------------------
+
             report_date = extract_report_date(
                 file_path
+            )
+
+            print(
+                f"Report date detected: "
+                f"{report_date.strftime('%Y-%m-%d')}"
             )
 
             # ------------------------------------------------
@@ -888,13 +150,9 @@ def process_uploaded_files():
             # We still read the file even if the date already
             # exists.
             #
-            # Why?
-            #
             # If a corrected report is uploaded for the same
-            # date, it should replace the previous snapshot.
+            # date, it replaces the previous snapshot.
             # ------------------------------------------------
-
-            print()
 
             df = process_file(
                 file_path
@@ -904,23 +162,106 @@ def process_uploaded_files():
                 df
             )
 
+            print(
+                f"✓ Successfully processed: "
+                f"{file_path.name}"
+            )
+
         except Exception as exc:
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # DO NOT raise the error.
+            #
+            # Skip this file and continue with the next Excel.
+            # ------------------------------------------------
 
             print()
 
             print(
                 f"ERROR processing "
-                f"{file_path.name}:"
+                f"{file_path.name}"
             )
 
             print(
-                str(exc)
+                f"→ {str(exc)}"
             )
 
-            raise
+            print(
+                "→ SKIP this file"
+            )
+
+            print(
+                "→ Continue processing remaining Excel files"
+            )
+
+            skipped_files.append(
+                {
+                    "file": file_path.name,
+                    "error": str(exc),
+                }
+            )
+
+            # Move to the NEXT file
+            continue
 
     # --------------------------------------------------------
-    # Combine all new uploads
+    # Processing summary
+    # --------------------------------------------------------
+
+    print()
+
+    print("=" * 70)
+
+    print(
+        "FILE PROCESSING SUMMARY"
+    )
+
+    print("=" * 70)
+
+    print()
+
+    print(
+        f"Total Excel files found: {len(files)}"
+    )
+
+    print(
+        f"Successfully processed: "
+        f"{len(new_data_frames)}"
+    )
+
+    print(
+        f"Skipped files: "
+        f"{len(skipped_files)}"
+    )
+
+    # --------------------------------------------------------
+    # Show skipped files
+    # --------------------------------------------------------
+
+    if skipped_files:
+
+        print()
+
+        print(
+            "Skipped Excel files:"
+        )
+
+        for item in skipped_files:
+
+            print(
+                f"  - {item['file']}"
+            )
+
+            print(
+                f"    Reason: {item['error']}"
+            )
+
+    print()
+
+    # --------------------------------------------------------
+    # Combine all valid uploads
     # --------------------------------------------------------
 
     if new_data_frames:
@@ -1151,182 +492,4 @@ def process_uploaded_files():
         )
 
     return combined
-
-
-# ============================================================
-# TEST / MAIN
-# ============================================================
-
-def test_progress_service():
-
-    print()
-
-    print("=" * 70)
-
-    print(
-        "RUBAVU PROGRESS SERVICE TEST"
-    )
-
-    print("=" * 70)
-
-    print()
-
-    print(
-        "Automatically processing uploaded Excel files..."
-    )
-
-    print()
-
-    df = process_uploaded_files()
-
-    if df.empty:
-
-        print()
-
-        print(
-            "No data processed."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Basic assertions
-    # --------------------------------------------------------
-
-    assert (
-        len(df) > 0
-    ), "Processed data should not be empty."
-
-    assert (
-        "report_date" in df.columns
-    ), "report_date missing."
-
-    assert (
-        "members" in df.columns
-    ), "members missing."
-
-    assert (
-        "amount" in df.columns
-    ), "amount missing."
-
-    # --------------------------------------------------------
-    # Validate latest snapshot
-    # --------------------------------------------------------
-
-    latest_date = (
-        df["report_date"]
-        .max()
-    )
-
-    latest = df[
-        df["report_date"]
-        == latest_date
-    ]
-
-    assert (
-        latest["sector"].nunique()
-        == EXPECTED_SECTORS
-    ), (
-        f"Expected {EXPECTED_SECTORS} sectors."
-    )
-
-    assert (
-        latest[
-            ["sector", "cell"]
-        ]
-        .drop_duplicates()
-        .shape[0]
-        == EXPECTED_CELLS
-    ), (
-        f"Expected {EXPECTED_CELLS} cells."
-    )
-
-    assert (
-        latest[
-            [
-                "sector",
-                "cell",
-                "village"
-            ]
-        ]
-        .drop_duplicates()
-        .shape[0]
-        == EXPECTED_VILLAGES
-    ), (
-        f"Expected {EXPECTED_VILLAGES} villages."
-    )
-
-    print()
-
-    print("=" * 70)
-
-    print(
-        "PROGRESS SERVICE TEST PASSED"
-    )
-
-    print("=" * 70)
-
-    print()
-
-    print(
-        "✓ Excel uploads detected automatically"
-    )
-
-    print(
-        "✓ Report date extracted automatically"
-    )
-
-    print(
-        "✓ 3-row Excel header handled"
-    )
-
-    print(
-        "✓ Locations normalized"
-    )
-
-    print(
-        "✓ 12 sectors validated"
-    )
-
-    print(
-        "✓ 80 cells validated"
-    )
-
-    print(
-        "✓ 519 villages validated"
-    )
-
-    print(
-        "✓ Level 1–5 members calculated"
-    )
-
-    print(
-        "✓ Level 1–5 money calculated"
-    )
-
-    print(
-        "✓ Historical dates retained"
-    )
-
-    print(
-        "✓ Same-date uploads safely replace old snapshots"
-    )
-
-    print(
-        "✓ Duplicate village/date records removed"
-    )
-
-    print(
-        "✓ Previous/current daily comparison available"
-    )
-
-    print()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == "__main__":
-
-    test_progress_service()
+```
