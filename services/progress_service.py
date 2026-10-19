@@ -130,62 +130,69 @@ def to_numeric(series) -> pd.Series:
 
 def extract_report_date(file_path: Path) -> pd.Timestamp:
     """
-    Extract report date from the first Excel cell.
+    Extract report date from the Excel header, falling back to the
+    filename when the workbook has no recognizable Report Date.
 
-    Actual Excel example:
-
-        Enrolment Report
-        Period: 2026
-        Report Date: 8/25/2026
-
+    Header example: Report Date: 8/25/2026
+    Filename example: REPORT ON 8-10-2026.xlsx (DD-MM-YYYY)
     """
 
-    raw = pd.read_excel(
-        file_path,
-        header=None,
-        nrows=3
-    )
+    # Try the first three Excel rows first. The report-date text may
+    # appear in a cell other than A1.
+    try:
+        raw = pd.read_excel(
+            file_path,
+            header=None,
+            nrows=3
+        )
+    except Exception:
+        raw = pd.DataFrame()
 
-    first_value = raw.iloc[0, 0]
-
-    if pd.isna(first_value):
-        raise ValueError(
-            f"Could not find report date in {file_path.name}"
+    if not raw.empty:
+        header_text = " ".join(
+            str(value)
+            for value in raw.to_numpy().flatten()
+            if not pd.isna(value)
         )
 
-    text = str(first_value)
+        match = re.search(
+            r"Report\s*Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
+            header_text,
+            flags=re.IGNORECASE
+        )
 
-    # Look specifically for:
-    #
-    # Report Date: 8/25/2026
-    #
+        if match:
+            report_date = pd.to_datetime(
+                match.group(1),
+                format="%m/%d/%Y",
+                errors="coerce"
+            )
+            if not pd.isna(report_date):
+                return pd.Timestamp(report_date).normalize()
+
+    # Fallback to filename, using Rwanda's DD-MM-YYYY convention.
+    # Therefore 8-10-2026 means 8 October 2026.
     match = re.search(
-        r"Report\s*Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
-        text,
-        flags=re.IGNORECASE
+        r"(?<!\d)(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})(?!\d)",
+        file_path.stem
     )
 
-    if not match:
-        raise ValueError(
-            f"Could not extract report date from "
-            f"{file_path.name}\n\n"
-            f"First cell contains:\n{text}"
+    if match:
+        day, month, year = map(int, match.groups())
+        report_date = pd.to_datetime(
+            f"{day:02d}-{month:02d}-{year:04d}",
+            format="%d-%m-%Y",
+            errors="coerce"
         )
+        if not pd.isna(report_date):
+            return pd.Timestamp(report_date).normalize()
 
-    date_text = match.group(1)
-
-    report_date = pd.to_datetime(
-        date_text,
-        errors="coerce"
+    raise ValueError(
+        f"Could not find a valid report date in {file_path.name}. "
+        "Expected a header such as 'Report Date: 8/25/2026' or a "
+        "filename containing a DD-MM-YYYY date such as "
+        "'REPORT ON 8-10-2026.xlsx'."
     )
-
-    if pd.isna(report_date):
-        raise ValueError(
-            f"Invalid report date '{date_text}' "
-            f"in {file_path.name}"
-        )
-
-    return pd.Timestamp(report_date).normalize()
 
 
 # ============================================================
